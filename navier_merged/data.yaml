@@ -1,0 +1,8 @@
+# Consolidated Navier Njord buoy dataset (train/valid/test merged)
+# Images downscaled to max 1280px long side, re-encoded JPEG q90.
+path: .
+train: images
+val: images
+
+nc: 6
+names: ['green','red','north','east','south','west']

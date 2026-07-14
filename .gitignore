@@ -1,0 +1,38 @@
+# ── Python ───────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ── Model weights ────────────────────────────────────────
+# Pretrained (yolo26*.pt) are re-downloadable; best.pt/last.pt are generated.
+*.pt
+
+# ── Training outputs ─────────────────────────────────────
+runs/
+
+# ── Generated caches & split lists ───────────────────────
+# Regenerate the split with: training/make_split.py (reads manifest.csv).
+# These also contain machine-specific absolute paths.
+*.cache
+navier_merged/train.txt
+navier_merged/val.txt
+navier_merged/test.txt
+navier_merged/data_split.yaml
+
+# ── Dataset image data (kept out of git; store/back up externally) ──
+navier_b/
+navier_merged/images/
+navier_merged/labels/
+
+# ── Archives & logs ──────────────────────────────────────
+*.zip
+*.7z
+*.log
+
+# ── OS / editor cruft ────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
