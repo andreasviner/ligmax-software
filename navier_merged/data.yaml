@@ -4,5 +4,6 @@ path: .
 train: images
 val: images
 
-nc: 6
-names: ['green','red','north','east','south','west']
+nc: 3
+# cardinal = north/east/south/west merged; differentiated downstream, not by the detector
+names: ['green','red','cardinal']

@@ -24,6 +24,7 @@ navier_merged/data_split.yaml
 navier_b/
 navier_merged/images/
 navier_merged/labels/
+navier_merged/labels_6class_backup/
 
 # ── Archives & logs ──────────────────────────────────────
 *.zip

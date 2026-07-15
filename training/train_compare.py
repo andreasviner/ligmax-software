@@ -34,7 +34,17 @@ def main():
     ap.add_argument("--device", default="")                # "" = auto
     ap.add_argument("--fraction", type=float, default=1.0) # subset train set (smoke)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--patience", type=int, default=50)
+    ap.add_argument("--patience", type=int, default=5)
+    # Augmentation tuned for the real use case: strong sun/glare + 220-deg fisheye
+    # lenses. "Train hard, fight easy" -> between Ultralytics defaults and heavy.
+    # (Only applied to fresh runs; resumed runs keep their checkpoint's saved args.)
+    ap.add_argument("--hsv_s", type=float, default=0.75)   # sun washout (def 0.7)
+    ap.add_argument("--hsv_v", type=float, default=0.55)   # sun/overexposure brightness (def 0.4)
+    ap.add_argument("--degrees", type=float, default=8.0)  # boat roll / edge tilt (def 0.0)
+    ap.add_argument("--translate", type=float, default=0.15)  # exercise radial positions (def 0.1)
+    ap.add_argument("--scale", type=float, default=0.55)   # wide-angle scale variation (def 0.5)
+    ap.add_argument("--shear", type=float, default=2.0)    # off-axis geometry (def 0.0)
+    ap.add_argument("--perspective", type=float, default=0.0008)  # closest lever to fisheye warp (def 0.0)
     ap.add_argument("--project", default=os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "runs", "compare")))
     ap.add_argument("--name", default="yolo26")
@@ -57,14 +67,32 @@ def main():
         print(f"\n{'='*60}\n>>> TRAIN yolo26{sz}\n{'='*60}", flush=True)
         t0 = time.time()
         try:
-            model = YOLO(f"yolo26{sz}.pt")  # COCO-pretrained -> transfer learning
-            model.train(
-                data=args.data, epochs=args.epochs, imgsz=args.imgsz,
-                batch=args.batch, device=device, seed=args.seed, deterministic=True,
-                fraction=args.fraction, patience=args.patience,
-                project=args.project, name=run_name, exist_ok=True, plots=True,
-                verbose=True,
-            )
+            run_dir = os.path.join(args.project, run_name)
+            last = os.path.join(run_dir, "weights", "last.pt")
+            if os.path.exists(last):  # crash/restart recovery: continue where we left off
+                print(f">>> RESUME yolo26{sz} from {last}", flush=True)
+                model = YOLO(last)
+                try:
+                    model.train(resume=True)  # uses the checkpoint's saved args
+                except Exception as re:
+                    # resume raises once a run has already hit its epoch/patience limit
+                    print(f"[resume] {type(re).__name__}: {re} -- run already complete, "
+                          f"skipping to eval", flush=True)
+            else:
+                model = YOLO(f"yolo26{sz}.pt")  # COCO-pretrained -> transfer learning
+                model.train(
+                    data=args.data, epochs=args.epochs, imgsz=args.imgsz,
+                    batch=args.batch, device=device, seed=args.seed, deterministic=True,
+                    fraction=args.fraction, patience=args.patience,
+                    project=args.project, name=run_name, exist_ok=True, plots=True,
+                    verbose=True,
+                    # sun + 220-deg fisheye augmentation (see argparse block above)
+                    # multi_scale=True,  # DISABLED: OOMs the 8GB GTX 1070 (AutoBatch probes 1280 -> batch=1 -> BatchNorm crash). scale=0.55 below already jitters scale.
+                    # close_mosaic=10,   # wait until early stopping is disabled
+                    hsv_s=args.hsv_s, hsv_v=args.hsv_v, degrees=args.degrees,
+                    translate=args.translate, scale=args.scale, shear=args.shear,
+                    perspective=args.perspective,
+                )
             best = os.path.join(args.project, run_name, "weights", "best.pt")
             best = best if os.path.exists(best) else os.path.join(
                 args.project, run_name, "weights", "last.pt")
