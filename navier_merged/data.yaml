@@ -6,4 +6,4 @@ val: images
 
 nc: 3
 # cardinal = north/east/south/west merged; differentiated downstream, not by the detector
-names: ['green','red','cardinal']
+names: ['green', 'red', 'cardinal']
