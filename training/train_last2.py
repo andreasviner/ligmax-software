@@ -33,11 +33,16 @@ Usage (on the GPU box, after `git pull`):
     python training/train_last2.py --batch 8       # if you still hit OOM
 """
 import os
+# Reduce allocator fragmentation (helps avoid OOM). setdefault so an explicit
+# `export PYTORCH_CUDA_ALLOC_CONF=...` still wins. NOTE: this does NOT fix "unspecified
+# launch failure" -- that is a kernel-launch/hardware fault, not a memory-pressure error.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import csv
 import json
 import argparse
 import time
 import gc
+import sys
 import traceback
 
 import torch
@@ -123,9 +128,30 @@ def get_device(arg):
 
 
 def empty_cuda():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass  # context may be corrupt after a CUDA fault; never mask the real error
+
+
+# Exit code that run_loop.sh watches for to restart a FRESH process after a GPU crash.
+CUDA_FAULT_EXIT = 75
+
+
+def is_cuda_fault(e):
+    """True for CUDA faults that CORRUPT the context -> unrecoverable in-process, the whole
+    process must restart (that is what run_loop.sh does). OOM is excluded on purpose: it is
+    recoverable and handled by the batch backoff."""
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return False
+    s = f"{type(e).__name__}: {e}".lower()
+    return any(k in s for k in (
+        "unspecified launch failure", "illegal memory access", "device-side assert",
+        "cuda error", "acceleratorerror", "cublas", "cudnn status",
+        "misaligned address", "an illegal instruction",
+    ))
 
 
 # ----------------------------------------------------------------------------- #
@@ -176,11 +202,13 @@ def upload_artifact(run, art_name, path, metadata=None):
 
 def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
     """on_fit_epoch_end: log epoch metrics to W&B and push best/last.pt as an artifact.
-    THIS is the real fix for weights never updating in the cloud. Uploads at epoch 1
-    (immediate confirmation + earliest safety net), then every `ckpt_every` epochs, then
-    the final epoch -- so a downloadable model exists almost from the start, not just at
+    THIS is the real fix for weights never updating in the cloud. Uploads after the FIRST
+    completed epoch of every run -- fresh OR resume (immediate confirmation + earliest
+    safety net), then every `ckpt_every` epochs, then the final epoch -- so a downloadable
+    model exists almost from the start and refreshes right after any restart, not just at
     the end. Each upload is a new version of the same artifact; download the 'latest'."""
     art_name = f"yolo26{sz}-{phase_tag}-ckpt"
+    state = {"uploaded": False}  # force an upload on the first epoch after any (re)start
 
     def cb(trainer):
         try:
@@ -213,7 +241,8 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
                 run.log(logd, step=epoch)
 
             is_last = total and epoch >= total
-            if epoch == 1 or (ckpt_every and epoch % ckpt_every == 0) or is_last:
+            first = not state["uploaded"]  # first completed epoch of THIS run (fresh/resume)
+            if first or (ckpt_every and epoch % ckpt_every == 0) or is_last:
                 art = wandb.Artifact(art_name, type="model", metadata={"epoch": epoch})
                 added = False
                 for p in (getattr(trainer, "best", None), getattr(trainer, "last", None)):
@@ -222,6 +251,7 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
                         added = True
                 if added:
                     run.log_artifact(art)
+                    state["uploaded"] = True
                     print(f"[wandb] checkpoint artifact '{art_name}' @ epoch {epoch} "
                           f"(download the 'latest' version)", flush=True)
         except Exception as e:  # non-fatal by design
@@ -282,6 +312,8 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
             try:
                 model.train(resume=True)  # uses the checkpoint's saved args
             except Exception as re:
+                if is_cuda_fault(re):
+                    raise  # a GPU crash is NOT "complete" -- propagate so the run restarts
                 print(f"[resume] {type(re).__name__}: {re} -- run already complete, "
                       f"skipping to eval.", flush=True)
         else:
@@ -316,13 +348,13 @@ def main():
     ap.add_argument("--fraction", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--patience", type=int, default=0)   # 0 => no early stop (train full)
-    # 0 is the SAFE default on this box: workers>0 deadlocks the DataLoader at the
-    # epoch/validation boundary on Windows + Python 3.14 (main process hangs in a
-    # C-level wait, so even Ctrl+C stops working). Only raise this if you have
-    # confirmed multi-worker loading is stable here.
-    ap.add_argument("--workers", type=int, default=0,
-                    help="dataloader workers. KEEP 0 on Windows/py3.14 (workers>0 hard-"
-                         "freezes at epoch end here). Raise only if proven stable.")
+    # Ubuntu box: workers>0 is fine and important here (heavy CPU-side augmentation would
+    # starve the GPU at workers=0). If you ever get an epoch-boundary hang: on Linux that
+    # is usually W&B (try WANDB_START_METHOD=thread) or, in Docker, too-small /dev/shm
+    # (use --ipc=host or a bigger shm) -- lower this only as a last resort.
+    ap.add_argument("--workers", type=int, default=8,
+                    help="dataloader workers (Linux: 8 is fine; lower only if you hit an "
+                         "epoch-boundary hang and W&B/shm fixes don't help).")
     ap.add_argument("--ckpt_every", type=int, default=10,
                     help="upload best/last.pt to W&B every N epochs (crash safety); "
                          "also always uploads at epoch 1 and the final epoch")
@@ -370,7 +402,18 @@ def main():
     results_dir = os.path.join(args.project, "_summary")
     os.makedirs(results_dir, exist_ok=True)
     csv_path = os.path.join(results_dir, "compare_results.csv")
+    json_path = os.path.join(results_dir, "compare_results.json")
     rows, names = [], None
+    # Reload prior results so the summary stays complete AND finished sizes are skipped
+    # across run_loop.sh restarts (crucial on a flaky GPU that restarts many times).
+    if os.path.exists(json_path):
+        try:
+            prev = json.load(open(json_path, encoding="utf-8"))
+            rows = prev.get("rows", []) or []
+            names = prev.get("class_names") or None
+        except Exception:
+            pass
+    done_models = {r.get("model") for r in rows if r and "error" not in r}
 
     common = dict(
         data=data_yaml, imgsz=args.imgsz, device=device, seed=args.seed,
@@ -382,6 +425,9 @@ def main():
     )
 
     for sz in args.sizes:
+        if f"yolo26{sz}" in done_models:
+            print(f">>> yolo26{sz} already complete (in summary) -- skipping.", flush=True)
+            continue
         print(f"\n{'='*64}\n>>> yolo26{sz}  (phase 1 base -> phase 2 finetune)\n{'='*64}", flush=True)
         t0 = time.time()
         group = f"{args.name}_{sz}"
@@ -445,15 +491,22 @@ def main():
                 empty_cuda()
 
         except Exception as e:
+            if is_cuda_fault(e):
+                print(f"\n[FATAL] CUDA fault in yolo26{sz}: {type(e).__name__}: {e}\n"
+                      f"        Context is corrupted; exiting {CUDA_FAULT_EXIT} so run_loop.sh\n"
+                      f"        restarts a FRESH process (resumes from last.pt, skips finished).",
+                      flush=True)
+                _persist(csv_path, json_path, rows, names)
+                empty_cuda()
+                sys.exit(CUDA_FAULT_EXIT)
             traceback.print_exc()
             rows.append({"model": f"yolo26{sz}", "error": f"{type(e).__name__}: {e}"})
         finally:
             empty_cuda()
 
-        _flush(csv_path, rows, names)  # incremental: a mid-run crash still leaves results
+        _persist(csv_path, json_path, rows, names)  # incremental: survive a mid-run crash
 
-    with open(os.path.join(results_dir, "compare_results.json"), "w", encoding="utf-8") as f:
-        json.dump({"class_names": names, "rows": rows}, f, indent=2)
+    _persist(csv_path, json_path, rows, names)
     print(f"\n[train_last2] summary -> {csv_path}", flush=True)
 
 
@@ -466,6 +519,13 @@ def _flush(csv_path, rows, names):
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in base})
+
+
+def _persist(csv_path, json_path, rows, names):
+    """Write CSV + JSON summary. JSON is reloaded on restart to skip finished sizes."""
+    _flush(csv_path, rows, names)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"class_names": names, "rows": rows}, f, indent=2)
 
 
 if __name__ == "__main__":
