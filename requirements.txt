@@ -29,3 +29,7 @@
 # opencv-python, pillow, pyyaml, scipy, matplotlib, pandas, tqdm, psutil,
 # py-cpuinfo, ultralytics-thop). If pip can't resolve on Python 3.14, bump this.
 ultralytics>=8.4.14
+
+# Cloud experiment tracking + model artifacts (train_last2.py). Requires a one-time
+# `wandb login` on the training box. Runs/weights are uploaded as versioned artifacts.
+wandb

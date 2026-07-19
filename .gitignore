@@ -19,6 +19,7 @@ navier_merged/train.txt
 navier_merged/val.txt
 navier_merged/test.txt
 navier_merged/data_split.yaml
+navier_merged/data_split3.yaml
 
 # ── Dataset image data (kept out of git; store/back up externally) ──
 navier_b/
