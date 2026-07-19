@@ -138,6 +138,9 @@ def empty_cuda():
 
 # Exit code that run_loop.sh watches for to restart a FRESH process after a GPU crash.
 CUDA_FAULT_EXIT = 75
+# Exit code for a fatal misconfig (no W&B login, offline mode) -- run_loop.sh must NOT
+# restart on this; restarting can't fix a config problem, it would just loop.
+CONFIG_FATAL_EXIT = 3
 
 
 def is_cuda_fault(e):
@@ -207,17 +210,82 @@ def wandb_init_resumable(project, name, group, job_type, config, run_dir):
                       config=config, id=run_id, resume="allow", reinit=True)
 
 
-def upload_artifact(run, art_name, path, metadata=None):
-    """Upload a single weights file as a versioned model artifact (crash-proof cloud copy)."""
+def _wandb_api_key():
+    """Best-effort, non-interactive detection of a W&B login. Checks env, the API object,
+    and ~/.netrc so we don't FALSELY abort a genuinely-logged-in box."""
+    if os.environ.get("WANDB_API_KEY"):
+        return os.environ["WANDB_API_KEY"]
     try:
-        if not (path and os.path.exists(path)):
-            return
-        art = wandb.Artifact(art_name, type="model", metadata=metadata or {})
-        art.add_file(str(path))
-        run.log_artifact(art)
-        print(f"[wandb] uploaded artifact '{art_name}' <- {os.path.basename(path)}", flush=True)
-    except Exception as e:  # never let a W&B hiccup kill training
-        print(f"[wandb] artifact upload failed (non-fatal): {type(e).__name__}: {e}", flush=True)
+        k = wandb.Api(timeout=30).api_key
+        if k:
+            return k
+    except Exception:
+        pass
+    try:
+        import netrc
+        for host in ("api.wandb.ai", "wandb.ai"):
+            auth = netrc.netrc().authenticators(host)
+            if auth and auth[2]:
+                return auth[2]
+    except Exception:
+        pass
+    return None
+
+
+def check_wandb_ready(project):
+    """Fail FAST (before training) if models could not reach the website. The whole point of
+    this run is retrievable models, so a misconfigured W&B must abort -- not train for hours
+    into a void. Non-interactive: never prompts."""
+    mode = os.environ.get("WANDB_MODE", "online").lower()
+    if mode in ("offline", "disabled", "dryrun"):
+        print(f"\n[wandb][FATAL] WANDB_MODE={mode}: artifacts stay LOCAL and never reach the "
+              f"website.\n  Fix:  unset WANDB_MODE   then relaunch.\n", flush=True)
+        sys.exit(CONFIG_FATAL_EXIT)
+    if not _wandb_api_key():
+        print("\n[wandb][FATAL] Not logged in to W&B -> nowhere to upload the models.\n"
+              "  Fix:  wandb login   (key from https://wandb.ai/authorize), then relaunch.\n"
+              "  Aborting NOW so you don't train with no way to retrieve the models.\n", flush=True)
+        sys.exit(CONFIG_FATAL_EXIT)
+    print(f"[wandb] auth OK, mode={mode}, project='{project}' -- models WILL be uploaded.",
+          flush=True)
+
+
+def upload_files(run, art_name, paths, metadata=None, wait=False, retries=4):
+    """Upload weights file(s) as ONE versioned model artifact. For deliverables pass
+    wait=True: it BLOCKS until the artifact is committed on the W&B server (so it survives an
+    immediate crash) and retries transient failures. Returns True iff confirmed/queued."""
+    files = [str(p) for p in paths if p and os.path.exists(str(p))]
+    if not files:
+        print(f"[wandb] WARN '{art_name}': no weights file found ({paths}); nothing uploaded.",
+              flush=True)
+        return False
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            art = wandb.Artifact(art_name, type="model", metadata=metadata or {})
+            for fp in files:
+                art.add_file(fp)
+            logged = run.log_artifact(art)
+            if wait:
+                logged.wait()  # block until the artifact is COMMITTED server-side
+            tag = " (CONFIRMED on server)" if wait else ""
+            print(f"[wandb] artifact '{art_name}' <- {[os.path.basename(f) for f in files]}{tag}",
+                  flush=True)
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"[wandb] upload '{art_name}' attempt {attempt}/{retries} failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            time.sleep(5 * attempt)
+    print(f"\n[wandb][ERROR] GAVE UP uploading '{art_name}' after {retries} tries: {last_err}\n"
+          f"           (the per-epoch '-ckpt' artifacts for this size likely still hold the "
+          f"weights)\n", flush=True)
+    return False
+
+
+def upload_artifact(run, art_name, path, metadata=None, wait=False):
+    """Single-file convenience wrapper around upload_files()."""
+    return upload_files(run, art_name, [path], metadata=metadata, wait=wait)
 
 
 def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
@@ -263,17 +331,13 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
             is_last = total and epoch >= total
             first = not state["uploaded"]  # first completed epoch of THIS run (fresh/resume)
             if first or (ckpt_every and epoch % ckpt_every == 0) or is_last:
-                art = wandb.Artifact(art_name, type="model", metadata={"epoch": epoch})
-                added = False
-                for p in (getattr(trainer, "best", None), getattr(trainer, "last", None)):
-                    if p and os.path.exists(str(p)):
-                        art.add_file(str(p))
-                        added = True
-                if added:
-                    run.log_artifact(art)
+                # Confirm (wait) on the FIRST upload of the run -- early proof the cloud path
+                # works -- and on the final epoch; periodic ones stay non-blocking for speed.
+                ok = upload_files(run, art_name,
+                                  [getattr(trainer, "best", None), getattr(trainer, "last", None)],
+                                  metadata={"epoch": epoch}, wait=(first or bool(is_last)))
+                if ok:
                     state["uploaded"] = True
-                    print(f"[wandb] checkpoint artifact '{art_name}' @ epoch {epoch} "
-                          f"(download the 'latest' version)", flush=True)
         except Exception as e:  # non-fatal by design
             print(f"[wandb-cb] non-fatal: {type(e).__name__}: {e}", flush=True)
 
@@ -348,8 +412,10 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
                                    args.batch, args.min_batch)
 
         best = best_or_last(run_dir)
+        # Deliverable: block until CONFIRMED on the server. After phase 2 this artifact
+        # (yolo26{sz}-finetune) IS the final model -- safe even if eval later crashes.
         upload_artifact(run, f"yolo26{sz}-{phase_tag}", best,
-                        metadata={"size": sz, "phase": phase_tag})
+                        metadata={"size": sz, "phase": phase_tag}, wait=True)
         return best
     finally:
         run.finish()
@@ -413,6 +479,9 @@ def main():
         ul_settings.update({"wandb": False})
     except Exception as e:
         print(f"[settings] could not disable native ultralytics W&B: {e}", flush=True)
+
+    # FAIL FAST if models could not be uploaded -- before spending any GPU time.
+    check_wandb_ready(args.wandb_project)
 
     data_yaml = args.data or ensure_data_yaml(script_dir)
     sanity_check_labels(data_yaml, nc=len(NAMES_3))
@@ -509,9 +578,10 @@ def main():
                 print(f"[done] {row}", flush=True)
                 eval_run.log({f"summary/{k}": v for k, v in row.items()
                               if isinstance(v, (int, float))})
-                # one clean, easy-to-find final model per size
+                # one clean, easy-to-find final model per size (confirmed on server)
                 upload_artifact(eval_run, f"yolo26{sz}-final", final_best,
-                                metadata={"size": sz, **{k: row[k] for k in ("mAP50-95", "mAP50")}})
+                                metadata={"size": sz, **{k: row[k] for k in ("mAP50-95", "mAP50")}},
+                                wait=True)
             finally:
                 eval_run.finish()
                 empty_cuda()

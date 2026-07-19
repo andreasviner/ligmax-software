@@ -37,6 +37,11 @@ while :; do
     echo "[run_loop] train_last2.py finished cleanly (exit 0). All done."
     break
   fi
+  if [ "$code" -eq 3 ]; then
+    echo "[run_loop] exit 3 = fatal config (W&B not logged in / offline mode). NOT restarting."
+    echo "[run_loop] Fix it (e.g. 'wandb login') and relaunch. Restarting can't fix a config error."
+    break
+  fi
   echo "[run_loop] exit code $code -- crash/GPU-fault recovery; restarting in ${SLEEP}s. (Ctrl+C to stop)"
   if [ "$n" -ge "$MAX" ]; then
     echo "[run_loop] hit MAX=$MAX restarts; stopping. Investigate GPU stability (see header notes)."
