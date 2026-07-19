@@ -175,8 +175,11 @@ def upload_artifact(run, art_name, path, metadata=None):
 
 
 def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
-    """on_fit_epoch_end: log epoch metrics to W&B and periodically push best/last.pt as
-    an artifact. THIS is the real fix for weights never updating in the cloud."""
+    """on_fit_epoch_end: log epoch metrics to W&B and push best/last.pt as an artifact.
+    THIS is the real fix for weights never updating in the cloud. Uploads at epoch 1
+    (immediate confirmation + earliest safety net), then every `ckpt_every` epochs, then
+    the final epoch -- so a downloadable model exists almost from the start, not just at
+    the end. Each upload is a new version of the same artifact; download the 'latest'."""
     art_name = f"yolo26{sz}-{phase_tag}-ckpt"
 
     def cb(trainer):
@@ -184,18 +187,33 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
             epoch = int(getattr(trainer, "epoch", 0)) + 1
             total = int(getattr(trainer, "epochs", 0) or 0)
 
-            metrics = {}
+            logd = {}
+            # validation metrics (mAP50-95/mAP50, precision, recall, val losses)
             for k, v in (getattr(trainer, "metrics", None) or {}).items():
                 try:
-                    metrics[k] = float(v)
+                    logd[k] = float(v)
                 except Exception:
                     pass
-            if metrics:
-                metrics["epoch"] = epoch
-                run.log(metrics, step=epoch)
+            # training losses (box/cls/dfl) -- richer charts
+            try:
+                tl = getattr(trainer, "tloss", None)
+                if tl is not None:
+                    for k, v in trainer.label_loss_items(tl, prefix="train").items():
+                        logd[k] = float(v)
+            except Exception:
+                pass
+            # learning rate(s)
+            try:
+                for k, v in (getattr(trainer, "lr", None) or {}).items():
+                    logd[k] = float(v)
+            except Exception:
+                pass
+            if logd:
+                logd["epoch"] = epoch
+                run.log(logd, step=epoch)
 
             is_last = total and epoch >= total
-            if epoch % ckpt_every == 0 or is_last:
+            if epoch == 1 or (ckpt_every and epoch % ckpt_every == 0) or is_last:
                 art = wandb.Artifact(art_name, type="model", metadata={"epoch": epoch})
                 added = False
                 for p in (getattr(trainer, "best", None), getattr(trainer, "last", None)):
@@ -204,7 +222,8 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
                         added = True
                 if added:
                     run.log_artifact(art)
-                    print(f"[wandb] checkpoint artifact '{art_name}' @ epoch {epoch}", flush=True)
+                    print(f"[wandb] checkpoint artifact '{art_name}' @ epoch {epoch} "
+                          f"(download the 'latest' version)", flush=True)
         except Exception as e:  # non-fatal by design
             print(f"[wandb-cb] non-fatal: {type(e).__name__}: {e}", flush=True)
 
@@ -297,11 +316,16 @@ def main():
     ap.add_argument("--fraction", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--patience", type=int, default=0)   # 0 => no early stop (train full)
-    ap.add_argument("--workers", type=int, default=8,
-                    help="dataloader workers; drop to 0 if you hit Windows/py3.14 "
-                         "DataLoader/shared-memory crashes.")
-    ap.add_argument("--ckpt_every", type=int, default=20,
-                    help="upload best/last.pt to W&B every N epochs (crash safety)")
+    # 0 is the SAFE default on this box: workers>0 deadlocks the DataLoader at the
+    # epoch/validation boundary on Windows + Python 3.14 (main process hangs in a
+    # C-level wait, so even Ctrl+C stops working). Only raise this if you have
+    # confirmed multi-worker loading is stable here.
+    ap.add_argument("--workers", type=int, default=0,
+                    help="dataloader workers. KEEP 0 on Windows/py3.14 (workers>0 hard-"
+                         "freezes at epoch end here). Raise only if proven stable.")
+    ap.add_argument("--ckpt_every", type=int, default=10,
+                    help="upload best/last.pt to W&B every N epochs (crash safety); "
+                         "also always uploads at epoch 1 and the final epoch")
     ap.add_argument("--ft_lr0", type=float, default=0.005, help="phase-2 initial LR")
     # multi_scale OFF by default: the +/-scale up to 1.5x imgsz is what OOM'd before.
     # It is a FLOAT fraction in this Ultralytics (True==1.0), NOT a bool.
