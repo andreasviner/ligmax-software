@@ -162,14 +162,34 @@ def best_or_last(run_dir):
     return b if os.path.exists(b) else os.path.join(run_dir, "weights", "last.pt")
 
 
-def phase_done(run_dir):
-    return os.path.exists(os.path.join(run_dir, ".phase_done"))
+def phase_finished(run_dir):
+    """True iff this phase TRULY completed. Ultralytics' strip_optimizer rewrites the final
+    last.pt to epoch == -1 when a run finishes; an interrupted run keeps epoch >= 0. We read
+    that single field instead of a marker file, because a crash could otherwise leave a bogus
+    'done' marker (that exact bug sent a run straight to finetuning). Safe-fails to False
+    (-> we just resume/retry) if the checkpoint can't be read."""
+    last = os.path.join(run_dir, "weights", "last.pt")
+    if not os.path.exists(last):
+        return False
+    try:
+        ck = torch.load(last, map_location="cpu", weights_only=False)
+        return int(ck.get("epoch", 0)) == -1
+    except Exception:
+        return False
 
 
-def mark_done(run_dir):
-    os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, ".phase_done"), "w", encoding="utf-8") as f:
-        f.write("ok\n")
+def resume_is_stale(run_dir, start_weights):
+    """True if this phase's last.pt predates its start weights -- i.e. the inputs were
+    (re)generated after our checkpoint, so resuming would continue from an outdated base.
+    Used for phase 2: if phase 1 was re-run, its best.pt is newer than a stale finetune
+    checkpoint, so we restart phase 2 fresh from the correct base instead of resuming."""
+    last = os.path.join(run_dir, "weights", "last.pt")
+    sw = str(start_weights)
+    try:
+        return (os.path.exists(last) and os.path.exists(sw)
+                and os.path.getmtime(sw) > os.path.getmtime(last))
+    except Exception:
+        return False
 
 
 def wandb_init_resumable(project, name, group, job_type, config, run_dir):
@@ -290,8 +310,8 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
     """Run one training phase: resumable W&B run + per-epoch checkpoint artifacts +
     resume-or-fresh(with OOM backoff). Returns path to the phase's best.pt."""
     run_name = os.path.basename(run_dir)
-    if phase_done(run_dir):
-        print(f">>> {run_name}: already complete -- skipping.", flush=True)
+    if phase_finished(run_dir):
+        print(f">>> {run_name}: already complete (checkpoint epoch=-1) -- skipping.", flush=True)
         return best_or_last(run_dir)
 
     run = wandb_init_resumable(
@@ -303,8 +323,12 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
     try:
         callbacks = {"on_fit_epoch_end": make_ckpt_callback(run, sz, phase_tag, args.ckpt_every)}
         last = os.path.join(run_dir, "weights", "last.pt")
+        stale = resume_is_stale(run_dir, start_weights)
+        if stale:
+            print(f">>> {run_name}: last.pt is older than its start weights -> discarding "
+                  f"stale checkpoint and restarting this phase fresh.", flush=True)
 
-        if resume_ok and os.path.exists(last):
+        if resume_ok and os.path.exists(last) and not stale:
             print(f">>> RESUME {run_name} from {last}", flush=True)
             model = YOLO(last)
             for ev, fn in callbacks.items():
@@ -314,8 +338,11 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
             except Exception as re:
                 if is_cuda_fault(re):
                     raise  # a GPU crash is NOT "complete" -- propagate so the run restarts
-                print(f"[resume] {type(re).__name__}: {re} -- run already complete, "
-                      f"skipping to eval.", flush=True)
+                msg = str(re).lower()
+                if "nothing to resume" in msg or "is finished" in msg or phase_finished(run_dir):
+                    print(f"[resume] {run_name} already finished -- skipping to eval.", flush=True)
+                else:
+                    raise  # a real error -- do NOT mask it as 'complete'
         else:
             train_with_oom_backoff(start_weights, train_kwargs, callbacks,
                                    args.batch, args.min_batch)
@@ -323,7 +350,6 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
         best = best_or_last(run_dir)
         upload_artifact(run, f"yolo26{sz}-{phase_tag}", best,
                         metadata={"size": sz, "phase": phase_tag})
-        mark_done(run_dir)
         return best
     finally:
         run.finish()
