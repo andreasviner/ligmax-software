@@ -1,0 +1,40 @@
+{
+  "os":  "Linux-7.0.0-28-generic-x86_64-with-glibc2.43",
+  "python":  "CPython 3.11.15",
+  "startedAt":  "2026-07-19T15:09:09.672905Z",
+  "program":  "/home/jadmin/Desktop/ligmax-software/training/train_last.py",
+  "codePath":  "training/train_last.py",
+  "codePathLocal":  "training/train_last.py",
+  "git":  {
+    "remote":  "https://github.com/andreasviner/ligmax-software.git",
+    "commit":  "74ccb17f6f3e0cf2ab6d734c532d49a34dd2bbe9"
+  },
+  "email":  "andreas.e.lindeman@gmail.com",
+  "root":  "/home/jadmin/Desktop/ligmax-software",
+  "host":  "jonastann-ubuntu",
+  "executable":  "/home/jadmin/miniconda3/envs/ml-env/bin/python3",
+  "cpu_count":  16,
+  "cpu_count_logical":  32,
+  "gpu":  "NVIDIA GeForce RTX 4090",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "87991361536",
+      "used":  "34887471104"
+    }
+  },
+  "memory":  {
+    "total":  "65427619840"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada",
+      "uuid":  "GPU-dc0eef2c-41e0-dd2f-8ab9-25b463d86b37"
+    }
+  ],
+  "cudaVersion":  "13.2",
+  "writerId":  "387x8d8pupv5ley47rcte21hqaxfo08h"
+}

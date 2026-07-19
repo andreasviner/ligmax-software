@@ -5,8 +5,9 @@ identical seed/config, and log a comparison row per model (mAP, per-class AP, sp
 params, FLOPs). Designed to run full on a GPU, or as a tiny CPU smoke-test.
 
 Examples:
-  # Full comparison (GPU):
-  python training/train_compare.py --sizes s m l x --epochs 150 --imgsz 640 --batch -1
+  # Full comparison (GPU) -- defaults already match this: sizes s/m/l, 150 epochs,
+  # imgsz 640, batch 16, NO early stopping, multi_scale + sun/fisheye augmentation:
+  python training/train_compare.py
 
   # CPU smoke-test (validate the pipeline; not meaningful metrics):
   python training/train_compare.py --sizes n --epochs 2 --imgsz 320 --batch 4 \
@@ -27,14 +28,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "navier_merged", "data_split.yaml")))
-    ap.add_argument("--sizes", nargs="+", default=["s", "m", "l", "x"])
+    ap.add_argument("--sizes", nargs="+", default=["s", "m", "l"])  # add "x" for the biggest
     ap.add_argument("--epochs", type=int, default=150)
     ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--batch", type=int, default=-1)      # -1 = auto (GPU)
+    # Fixed batch (NOT autobatch): multi_scale trains up to 1.5x imgsz, which OOMs
+    # batch=-1 (autobatch probes at base imgsz then overflows at peak scale). 16 is
+    # safe for s/m/l on a 24GB 4090 and keeps the size comparison fair. Raise if you
+    # have headroom (watch epoch 1 -- a multi_scale OOM shows up there).
+    ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--device", default="")                # "" = auto
     ap.add_argument("--fraction", type=float, default=1.0) # subset train set (smoke)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--patience", type=int, default=5)
+    # 0 => no early stopping (Ultralytics maps patience=0 -> inf); trains full --epochs.
+    ap.add_argument("--patience", type=int, default=0)
     # Augmentation tuned for the real use case: strong sun/glare + 220-deg fisheye
     # lenses. "Train hard, fight easy" -> between Ultralytics defaults and heavy.
     # (Only applied to fresh runs; resumed runs keep their checkpoint's saved args.)
@@ -87,8 +93,8 @@ def main():
                     project=args.project, name=run_name, exist_ok=True, plots=True,
                     verbose=True,
                     # sun + 220-deg fisheye augmentation (see argparse block above)
-                    # multi_scale=True,  # DISABLED: OOMs the 8GB GTX 1070 (AutoBatch probes 1280 -> batch=1 -> BatchNorm crash). scale=0.55 below already jitters scale.
-                    # close_mosaic=10,   # wait until early stopping is disabled
+                    multi_scale=0.5,   # FLOAT fraction (NOT bool) in this Ultralytics: +/-50% -> trains at 0.5x-1.5x imgsz (~320-960 @ 640). (multi_scale=True == 1.0 lets the random size floor to 0 -> interpolate crash.) OK on 24GB with a FIXED batch; pairs badly with batch=-1.
+                    close_mosaic=10,   # mosaic off for the last 10 epochs (reached because early stop is disabled by default; see --patience)
                     hsv_s=args.hsv_s, hsv_v=args.hsv_v, degrees=args.degrees,
                     translate=args.translate, scale=args.scale, shear=args.shear,
                     perspective=args.perspective,
