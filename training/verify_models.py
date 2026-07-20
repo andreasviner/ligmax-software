@@ -37,6 +37,10 @@ def main():
     ap.add_argument("--entity", default="", help="W&B entity/username (default: your login)")
     ap.add_argument("--sizes", nargs="+", default=["m", "n", "s", "l"])
     ap.add_argument("--download", default="", help="directory to download the final models into")
+    ap.add_argument("--prune-ckpts", type=int, default=0, metavar="KEEP",
+                    help="delete old '-ckpt' artifact versions, keeping the newest KEEP "
+                         "(e.g. --prune-ckpts 3). Deliverables are never touched. Safe to run "
+                         "while training continues.")
     args = ap.parse_args()
 
     try:
@@ -51,6 +55,42 @@ def main():
 
     base = f"{entity}/{args.project}"
     print(f"[verify] project: {base}\n")
+
+    if args.prune_ckpts:
+        keep = args.prune_ckpts
+        print(f"[prune] deleting old '-ckpt' versions, keeping newest {keep} per collection...")
+        for sz in args.sizes:
+            for suf in ("base-ckpt", "finetune-ckpt"):
+                name = f"{base}/yolo26{sz}-{suf}"
+                versions = None
+                for getter in (lambda: list(api.artifacts("model", name)),
+                               lambda: list(api.artifact_versions("model", name))):
+                    try:
+                        versions = getter()
+                        if versions:
+                            break
+                    except Exception:
+                        continue
+                if not versions:
+                    continue
+
+                def _vnum(a):
+                    try:
+                        return int(str(a.version).lstrip("v"))
+                    except Exception:
+                        return -1
+
+                versions.sort(key=_vnum, reverse=True)
+                deleted = 0
+                for old in versions[keep:]:
+                    try:
+                        old.delete(delete_aliases=True)
+                        deleted += 1
+                    except Exception as e:
+                        print(f"   could not delete {name}:{old.version}: {e}")
+                if deleted:
+                    print(f"   {name}: deleted {deleted}, kept {min(keep, len(versions))}")
+        print()
 
     all_ok = True
     for sz in args.sizes:

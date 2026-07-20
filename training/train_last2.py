@@ -288,7 +288,43 @@ def upload_artifact(run, art_name, path, metadata=None, wait=False):
     return upload_files(run, art_name, [path], metadata=metadata, wait=wait)
 
 
-def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
+def prune_artifact_versions(entity, project, art_name, keep=3):
+    """Delete all but the newest `keep` versions of a checkpoint artifact so periodic
+    uploads don't accumulate forever. Only used for the throwaway '-ckpt' safety copies --
+    NOT the deliverables. Best-effort and fully non-fatal (if the W&B API shape differs,
+    we simply skip pruning; storage grows but training is unaffected)."""
+    path = f"{entity}/{project}/{art_name}"
+    try:
+        api = wandb.Api()
+        versions = None
+        for getter in (lambda: list(api.artifacts("model", path)),
+                       lambda: list(api.artifact_versions("model", path))):
+            try:
+                versions = getter()
+                if versions:
+                    break
+            except Exception:
+                continue
+        if not versions:
+            return
+
+        def vnum(a):
+            try:
+                return int(str(a.version).lstrip("v"))
+            except Exception:
+                return -1
+
+        versions.sort(key=vnum, reverse=True)  # newest first
+        for old in versions[keep:]:
+            try:
+                old.delete(delete_aliases=True)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[wandb] ckpt prune skipped ({type(e).__name__}: {e})", flush=True)
+
+
+def make_ckpt_callback(run, sz, phase_tag, ckpt_every, ckpt_keep=3):
     """on_fit_epoch_end: log epoch metrics to W&B and push best/last.pt as an artifact.
     THIS is the real fix for weights never updating in the cloud. Uploads after the FIRST
     completed epoch of every run -- fresh OR resume (immediate confirmation + earliest
@@ -338,6 +374,8 @@ def make_ckpt_callback(run, sz, phase_tag, ckpt_every):
                                   metadata={"epoch": epoch}, wait=(first or bool(is_last)))
                 if ok:
                     state["uploaded"] = True
+                    # keep only the newest few '-ckpt' versions so they don't pile up
+                    prune_artifact_versions(run.entity, run.project, art_name, keep=ckpt_keep)
         except Exception as e:  # non-fatal by design
             print(f"[wandb-cb] non-fatal: {type(e).__name__}: {e}", flush=True)
 
@@ -385,7 +423,8 @@ def do_phase(phase_tag, sz, run_dir, start_weights, train_kwargs, args, resume_o
                 "start_weights": os.path.basename(str(start_weights))},
         run_dir=run_dir)
     try:
-        callbacks = {"on_fit_epoch_end": make_ckpt_callback(run, sz, phase_tag, args.ckpt_every)}
+        callbacks = {"on_fit_epoch_end":
+                     make_ckpt_callback(run, sz, phase_tag, args.ckpt_every, args.ckpt_keep)}
         last = os.path.join(run_dir, "weights", "last.pt")
         stale = resume_is_stale(run_dir, start_weights)
         if stale:
@@ -450,6 +489,9 @@ def main():
     ap.add_argument("--ckpt_every", type=int, default=10,
                     help="upload best/last.pt to W&B every N epochs (crash safety); "
                          "also always uploads at epoch 1 and the final epoch")
+    ap.add_argument("--ckpt_keep", type=int, default=3,
+                    help="how many recent '-ckpt' artifact versions to keep (older ones are "
+                         "pruned so periodic uploads don't fill W&B storage). Deliverables kept.")
     ap.add_argument("--ft_lr0", type=float, default=0.005, help="phase-2 initial LR")
     # multi_scale OFF by default: the +/-scale up to 1.5x imgsz is what OOM'd before.
     # It is a FLOAT fraction in this Ultralytics (True==1.0), NOT a bool.

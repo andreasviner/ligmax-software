@@ -1,0 +1,58 @@
+# systemd unit: unattended, crash-proof YOLO26 training.
+# Survives terminal/SSH death, X (display) crashes, AND reboots, and auto-restarts on GPU
+# faults -- because a systemd service has no controlling terminal to be killed with.
+#
+# It runs train_last2.py DIRECTLY (not run_loop.sh) and lets systemd do the restarting:
+#   exit 0   -> done (no restart)          exit 3  -> fatal config, e.g. W&B not logged in
+#   exit 75  -> CUDA fault -> restart       any other non-zero -> restart
+# train_last2.py resumes from last.pt, skips finished sizes, and uploads to W&B each run.
+#
+# ── SETUP ────────────────────────────────────────────────────────────────────
+# 1. Edit the four >>>EDIT<<< lines below (user, repo path, python path, log path).
+#    Find your python:  which python    (use the SAME one that has torch+cuda+wandb).
+#    Make sure that user has already run `wandb login` (systemd won't prompt).
+# 2. Install + start:
+#      sudo cp training/njord-train.service /etc/systemd/system/njord-train.service
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now njord-train.service      # enable = also start on boot
+# 3. Watch it:
+#      journalctl -u njord-train.service -f                 # live log
+#      systemctl status njord-train.service
+# 4. Stop it for good (when models are done / you want to intervene):
+#      sudo systemctl disable --now njord-train.service
+
+[Unit]
+Description=Njord YOLO26 training (auto-restart, crash-proof)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=>>>EDIT<<<_your_username
+WorkingDirectory=>>>EDIT<<<_/absolute/path/to/ligmax-software
+
+# Use the SAME python that has torch(cuda)+ultralytics+wandb. Examples:
+#   /usr/bin/python3
+#   /home/USER/miniconda3/envs/njord/bin/python
+#   /home/USER/ligmax-software/.venv/bin/python
+ExecStart=>>>EDIT<<<_/path/to/python -u training/train_last2.py --batch 8
+
+# Restart on any failure/crash, but NOT on clean completion (0) or fatal config (3).
+Restart=on-failure
+RestartSec=30
+SuccessExitStatus=0
+RestartPreventExitStatus=3
+
+# Give the GPU a moment to settle between restarts; cap total restarts generously.
+StartLimitIntervalSec=0
+
+# Keep a full log on disk (in addition to journalctl).
+StandardOutput=append:>>>EDIT<<<_/home/USER/njord-train.log
+StandardError=append:>>>EDIT<<<_/home/USER/njord-train.log
+
+# Optional: cap GPU power here too (needs the service to run as root, or set it once
+# manually with `sudo nvidia-smi -pl 250` before enabling this service):
+# ExecStartPre=/usr/bin/nvidia-smi -pl 250
+
+[Install]
+WantedBy=multi-user.target
