@@ -13,7 +13,9 @@
 #    Make sure that user has already run `wandb login` (systemd won't prompt).
 # 2. Install + start:
 #      sudo cp training/njord-train.service /etc/systemd/system/njord-train.service
+#      sudo systemd-analyze verify /etc/systemd/system/njord-train.service   # catches typos/bad keys
 #      sudo systemctl daemon-reload
+#      sudo systemctl reset-failed njord-train.service      # clear any earlier failed state
 #      sudo systemctl enable --now njord-train.service      # enable = also start on boot
 # 3. Watch it:
 #      journalctl -u njord-train.service -f                 # live log
@@ -25,6 +27,9 @@
 Description=Njord YOLO26 training (auto-restart, crash-proof)
 After=network-online.target
 Wants=network-online.target
+# Restart rate-limiting MUST live in [Unit] (not [Service]) on modern systemd.
+# 0 = never rate-limit => unlimited restarts, which the flaky GPU needs.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -40,11 +45,7 @@ ExecStart=>>>EDIT<<<_/path/to/python -u training/train_last2.py --batch 8
 # Restart on any failure/crash, but NOT on clean completion (0) or fatal config (3).
 Restart=on-failure
 RestartSec=30
-SuccessExitStatus=0
 RestartPreventExitStatus=3
-
-# Give the GPU a moment to settle between restarts; cap total restarts generously.
-StartLimitIntervalSec=0
 
 # Keep a full log on disk (in addition to journalctl).
 StandardOutput=append:>>>EDIT<<<_/home/USER/njord-train.log
